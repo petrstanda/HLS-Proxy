@@ -20,11 +20,16 @@ retries = Retry(total=3, backoff_factor=0.3, status_forcelist=[500, 502, 503, 50
 session.mount('https://', HTTPAdapter(pool_connections=30, pool_maxsize=30, max_retries=retries))
 session.mount('http://', HTTPAdapter(pool_connections=30, pool_maxsize=30, max_retries=retries))
 
-def get_headers_for_url(url):
+def get_headers_for_url(url, custom_referer=None):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     }
-    if any(k in url for k in ["matchora", "kugunor", "onhockey"]):
+    if custom_referer:
+        headers["Referer"] = custom_referer
+        parsed_ref = urllib.parse.urlparse(custom_referer)
+        if parsed_ref.scheme and parsed_ref.netloc:
+            headers["Origin"] = f"{parsed_ref.scheme}://{parsed_ref.netloc}"
+    elif any(k in url for k in ["matchora", "kugunor", "onhockey"]):
         headers["Referer"] = "https://matchora.to/"
         headers["Origin"] = "https://matchora.to"
     return headers
@@ -228,12 +233,20 @@ class StreamManager:
     def __init__(self):
         self.lock = threading.Lock()
         self.raw_input = ""
+        self.custom_referer = ""
         self.active_m3u8_url = ""
         self.token_expiry = 0
         self.matchora_ch = None
         self.epoch = 1
         self.file_mtime = 0
         self.load_from_file()
+
+    def _parse_entry(self, text):
+        text = text.strip()
+        if "|" in text:
+            u, r = text.split("|", 1)
+            return u.strip(), r.strip()
+        return text, ""
 
     def check_file_change(self):
         """Automaticky detekuje, zda uživatel neupravil soubor stream_url.txt ručně na disku."""
@@ -244,18 +257,21 @@ class StreamManager:
                     with open(STREAM_FILE, "r", encoding="utf-8") as f:
                         new_content = f.read().strip()
                     self.file_mtime = mtime
-                    if new_content != self.raw_input:
+                    new_url, new_ref = self._parse_entry(new_content)
+                    if new_url != self.raw_input or new_ref != self.custom_referer:
                         print(f"[*] Zjistena zmena v {STREAM_FILE}!")
-                        self.set_stream(new_content, save_file=False)
+                        self.set_stream(new_url, custom_referer=new_ref, save_file=False)
             except Exception as e:
                 print(f"[!] Chyba cteni souboru: {e}")
 
-    def set_stream(self, url, save_file=True):
+    def set_stream(self, url, custom_referer="", save_file=True):
         with self.lock:
-            url_clean = url.strip()
-            if url_clean == self.raw_input:
+            url_clean, parsed_ref = self._parse_entry(url)
+            ref_clean = custom_referer.strip() if custom_referer else parsed_ref
+            if url_clean == self.raw_input and ref_clean == self.custom_referer:
                 return
             self.raw_input = url_clean
+            self.custom_referer = ref_clean
             self.matchora_ch = extract_matchora_channel_id(self.raw_input)
             self.active_m3u8_url = ""
             self.token_expiry = 0
@@ -263,13 +279,16 @@ class StreamManager:
 
             if save_file:
                 try:
+                    line = f"{self.raw_input}|{self.custom_referer}" if self.custom_referer else self.raw_input
                     with open(STREAM_FILE, "w", encoding="utf-8") as f:
-                        f.write(self.raw_input + "\n")
+                        f.write(line + "\n")
                     self.file_mtime = os.path.getmtime(STREAM_FILE)
                 except Exception as e:
                     print(f"[!] Nelze zapsat do {STREAM_FILE}: {e}")
 
             print(f"[+] Nastaven novy stream (epoch {self.epoch}): {self.raw_input[:70]}...")
+            if self.custom_referer:
+                print(f"[+] Pouzit vlastni Referer: {self.custom_referer}")
 
     def load_from_file(self):
         if os.path.exists(STREAM_FILE):
@@ -278,7 +297,7 @@ class StreamManager:
                 with open(STREAM_FILE, "r", encoding="utf-8") as f:
                     content = f.read().strip()
                 if content:
-                    self.raw_input = content
+                    self.raw_input, self.custom_referer = self._parse_entry(content)
                     self.matchora_ch = extract_matchora_channel_id(self.raw_input)
             except Exception as e:
                 print(f"[!] Chyba nacitani {STREAM_FILE}: {e}")
@@ -341,8 +360,9 @@ class UniversalHLSHandler(BaseHTTPRequestHandler):
             post_data = self.rfile.read(content_length).decode('utf-8')
             params = urllib.parse.parse_qs(post_data)
             new_url = params.get('url', [''])[0].strip()
+            new_ref = params.get('referer', [''])[0].strip()
             if new_url:
-                stream_manager.set_stream(new_url, save_file=True)
+                stream_manager.set_stream(new_url, custom_referer=new_ref, save_file=True)
             self.send_response(303)
             self.send_header('Location', '/')
             self.end_headers()
@@ -397,6 +417,7 @@ input[type=submit]:hover {{ background: #04d361; }}
   <h3>Změnit stream (zápas):</h3>
   <form method="POST" action="/set_stream">
     <input type="text" name="url" placeholder="Vložte nové m3u8 nebo embed URL..." value="{stream_manager.raw_input}">
+    <input type="text" name="referer" placeholder="Volitelný Referer (např. https://stranka-prehravace.cz/)" value="{stream_manager.custom_referer}">
     <input type="submit" value="Přepnout stream na televizi">
   </form>
   <div class="sub">
@@ -424,17 +445,21 @@ input[type=submit]:hover {{ background: #04d361; }}
                     self.wfile.write("Zadny stream neni nastaven. Zadejte stream do stream_url.txt nebo pres web na http://localhost:8080/".encode())
                 return
 
-            headers = get_headers_for_url(target_url)
+            headers = get_headers_for_url(target_url, stream_manager.custom_referer)
+            last_status = None
             try:
                 resp = session.get(target_url, headers=headers, timeout=8)
                 if (resp.status_code == 403 or "bad token" in resp.text) and stream_manager.matchora_ch:
                     print("[!] Token expiroval, obnovuji token...")
                     target_url, epoch = stream_manager.get_active_url(force_refresh=True)
-                    resp = session.get(target_url, headers=get_headers_for_url(target_url), timeout=8)
+                    resp = session.get(target_url, headers=get_headers_for_url(target_url, stream_manager.custom_referer), timeout=8)
 
+                last_status = resp.status_code
                 if resp.status_code == 200:
                     real_url, content = resolve_variant_if_master(target_url, resp.text)
                     playlist_engine.update(epoch, content, real_url)
+                else:
+                    print(f"[!] Zdroj vratil HTTP {resp.status_code} pro {target_url[:70]}...")
             except Exception as e:
                 print(f"[!] Chyba stahovani playlistu ze zdroje: {e}")
 
@@ -443,9 +468,10 @@ input[type=submit]:hover {{ background: #04d361; }}
             if playlist_content:
                 self.send_playlist(playlist_content)
             else:
-                self.send_response(503)
+                err_code = last_status if last_status and last_status >= 400 else 503
+                self.send_response(err_code)
                 self.end_headers()
-                self.wfile.write(b"Cekam na data streamu...")
+                self.wfile.write(f"Zdroj nedostupny (HTTP {err_code}). Zkontrolujte platnost odkazu nebo Referer.".encode())
 
         elif path == "/segment":
             seg_urls = query.get("url")
@@ -455,7 +481,7 @@ input[type=submit]:hover {{ background: #04d361; }}
                 return
 
             seg_url = seg_urls[0]
-            headers = get_headers_for_url(seg_url)
+            headers = get_headers_for_url(seg_url, stream_manager.custom_referer)
             try:
                 resp = session.get(seg_url, headers=headers, timeout=12)
                 if resp.status_code != 200:
